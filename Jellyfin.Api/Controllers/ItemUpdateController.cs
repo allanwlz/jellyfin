@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.ComponentModel.DataAnnotations;
+using System.Globalization;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
@@ -8,6 +9,7 @@ using Jellyfin.Api.Constants;
 using Jellyfin.Api.Extensions;
 using Jellyfin.Api.Helpers;
 using Jellyfin.Data.Enums;
+using Jellyfin.Database.Implementations.Entities;
 using MediaBrowser.Common.Api;
 using MediaBrowser.Controller.Configuration;
 using MediaBrowser.Controller.Entities;
@@ -16,6 +18,7 @@ using MediaBrowser.Controller.Entities.TV;
 using MediaBrowser.Controller.Library;
 using MediaBrowser.Controller.LiveTv;
 using MediaBrowser.Controller.Providers;
+using MediaBrowser.Model.Activity;
 using MediaBrowser.Model.Dto;
 using MediaBrowser.Model.Entities;
 using MediaBrowser.Model.Globalization;
@@ -23,6 +26,7 @@ using MediaBrowser.Model.IO;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.Extensions.Logging;
 
 namespace Jellyfin.Api.Controllers;
 
@@ -34,37 +38,51 @@ namespace Jellyfin.Api.Controllers;
 public class ItemUpdateController : BaseJellyfinApiController
 {
     private readonly ILibraryManager _libraryManager;
+    private readonly IUserManager _userManager;
     private readonly IProviderManager _providerManager;
+    private readonly IActivityManager _activityManager;
     private readonly ILocalizationManager _localizationManager;
     private readonly IFileSystem _fileSystem;
     private readonly IServerConfigurationManager _serverConfigurationManager;
+    private readonly ILogger<ItemUpdateController> _logger;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="ItemUpdateController"/> class.
     /// </summary>
     /// <param name="fileSystem">Instance of the <see cref="IFileSystem"/> interface.</param>
     /// <param name="libraryManager">Instance of the <see cref="ILibraryManager"/> interface.</param>
+    /// <param name="userManager">Instance of the <see cref="IUserManager"/> interface.</param>
     /// <param name="providerManager">Instance of the <see cref="IProviderManager"/> interface.</param>
+    /// <param name="activityManager">Instance of the <see cref="IActivityManager"/> interface.</param>
     /// <param name="localizationManager">Instance of the <see cref="ILocalizationManager"/> interface.</param>
     /// <param name="serverConfigurationManager">Instance of the <see cref="IServerConfigurationManager"/> interface.</param>
+    /// <param name="logger">Instance of the <see cref="ILogger{ItemUpdateController}"/> interface.</param>
     public ItemUpdateController(
         IFileSystem fileSystem,
         ILibraryManager libraryManager,
+        IUserManager userManager,
         IProviderManager providerManager,
+        IActivityManager activityManager,
         ILocalizationManager localizationManager,
-        IServerConfigurationManager serverConfigurationManager)
+        IServerConfigurationManager serverConfigurationManager,
+        ILogger<ItemUpdateController> logger)
     {
         _libraryManager = libraryManager;
+        _userManager = userManager;
         _providerManager = providerManager;
+        _activityManager = activityManager;
         _localizationManager = localizationManager;
         _fileSystem = fileSystem;
         _serverConfigurationManager = serverConfigurationManager;
+        _logger = logger;
     }
 
     /// <summary>
     /// Updates an item.
     /// </summary>
     /// <param name="itemId">The item id.</param>
+    /// <param name="playSessionId">The playback session identifier.</param>
+    /// <param name="positionTicks">The playback position in ticks.</param>
     /// <param name="request">The new item properties.</param>
     /// <response code="204">Item updated.</response>
     /// <response code="404">Item not found.</response>
@@ -72,7 +90,11 @@ public class ItemUpdateController : BaseJellyfinApiController
     [HttpPost("Items/{itemId}")]
     [ProducesResponseType(StatusCodes.Status204NoContent)]
     [ProducesResponseType(StatusCodes.Status404NotFound)]
-    public async Task<ActionResult> UpdateItem([FromRoute, Required] Guid itemId, [FromBody, Required] BaseItemDto request)
+    public async Task<ActionResult> UpdateItem(
+        [FromRoute, Required] Guid itemId,
+        [FromQuery] string? playSessionId,
+        [FromQuery] long? positionTicks,
+        [FromBody, Required] BaseItemDto request)
     {
         var item = _libraryManager.GetItemById<BaseItem>(itemId, User.GetUserId());
         if (item is null)
@@ -80,6 +102,7 @@ public class ItemUpdateController : BaseJellyfinApiController
             return NotFound();
         }
 
+        var previousTags = item.Tags;
         var newLockData = request.LockData ?? false;
         var isLockedChanged = item.IsLocked != newLockData;
 
@@ -130,6 +153,12 @@ public class ItemUpdateController : BaseJellyfinApiController
                     ReplaceAllMetadata = true
                 },
                 RefreshPriority.High);
+        }
+
+        var tagsChanged = !previousTags.SequenceEqual(item.Tags, StringComparer.OrdinalIgnoreCase);
+        if (tagsChanged)
+        {
+            await TryLogPlaybackTagUpdateAsync(item, previousTags, item.Tags, playSessionId, positionTicks).ConfigureAwait(false);
         }
 
         return NoContent();
@@ -541,5 +570,69 @@ public class ItemUpdateController : BaseJellyfinApiController
         }
 
         return list;
+    }
+
+    private async Task TryLogPlaybackTagUpdateAsync(
+        BaseItem item,
+        IReadOnlyCollection<string> previousTags,
+        IReadOnlyCollection<string> currentTags,
+        string? playSessionId,
+        long? positionTicks)
+    {
+        if (string.IsNullOrWhiteSpace(playSessionId) && !positionTicks.HasValue)
+        {
+            return;
+        }
+
+        var user = _userManager.GetUserById(User.GetUserId());
+        if (user is null)
+        {
+            return;
+        }
+
+        var addedTags = currentTags.Except(previousTags, StringComparer.OrdinalIgnoreCase).ToArray();
+        var removedTags = previousTags.Except(currentTags, StringComparer.OrdinalIgnoreCase).ToArray();
+        if (addedTags.Length == 0 && removedTags.Length == 0)
+        {
+            return;
+        }
+
+        try
+        {
+            var added = addedTags.Length == 0 ? "-" : string.Join(", ", addedTags);
+            var removed = removedTags.Length == 0 ? "-" : string.Join(", ", removedTags);
+            await _activityManager.CreateAsync(new ActivityLog(
+                string.Format(
+                    CultureInfo.InvariantCulture,
+                    "{0} updated tags for {1}",
+                    user.Username,
+                    item.Name),
+                "PlaybackItemTagsUpdated",
+                user.Id)
+            {
+                ItemId = item.Id.ToString("N", CultureInfo.InvariantCulture),
+                Overview = string.Format(CultureInfo.InvariantCulture, "added=[{0}]; removed=[{1}]", added, removed),
+                ShortOverview = BuildPlaybackContextOverview(playSessionId, positionTicks)
+            }).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Error logging playback tags update for item {ItemId}", item.Id);
+        }
+    }
+
+    private static string BuildPlaybackContextOverview(string? playSessionId, long? positionTicks)
+    {
+        var sessionValue = string.IsNullOrWhiteSpace(playSessionId)
+            ? "n/a"
+            : playSessionId;
+        var positionValue = positionTicks.HasValue
+            ? positionTicks.Value.ToString(CultureInfo.InvariantCulture)
+            : "n/a";
+        return string.Format(
+            CultureInfo.InvariantCulture,
+            "playSessionId={0}; positionTicks={1}",
+            sessionValue,
+            positionValue);
     }
 }

@@ -355,6 +355,8 @@ public class LibraryController : BaseJellyfinApiController
     /// Deletes an item from the library and filesystem.
     /// </summary>
     /// <param name="itemId">The item id.</param>
+    /// <param name="playSessionId">The playback session identifier.</param>
+    /// <param name="positionTicks">The playback position in ticks.</param>
     /// <response code="204">Item deleted.</response>
     /// <response code="401">Unauthorized access.</response>
     /// <response code="404">Item not found.</response>
@@ -364,7 +366,10 @@ public class LibraryController : BaseJellyfinApiController
     [ProducesResponseType(StatusCodes.Status204NoContent)]
     [ProducesResponseType(StatusCodes.Status401Unauthorized)]
     [ProducesResponseType(StatusCodes.Status404NotFound)]
-    public ActionResult DeleteItem(Guid itemId)
+    public async Task<ActionResult> DeleteItem(
+        [FromRoute, Required] Guid itemId,
+        [FromQuery] string? playSessionId,
+        [FromQuery] long? positionTicks)
     {
         var userId = User.GetUserId();
         var isApiKey = User.GetIsApiKey();
@@ -392,6 +397,8 @@ public class LibraryController : BaseJellyfinApiController
             item,
             new DeleteOptions { DeleteFileLocation = true },
             true);
+
+        await TryLogPlaybackDeleteAsync(user, item, playSessionId, positionTicks).ConfigureAwait(false);
 
         return NoContent();
     }
@@ -1011,6 +1018,46 @@ public class LibraryController : BaseJellyfinApiController
         {
             // Logged at lower levels
         }
+    }
+
+    private async Task TryLogPlaybackDeleteAsync(User? user, BaseItem item, string? playSessionId, long? positionTicks)
+    {
+        if (user is null || (string.IsNullOrWhiteSpace(playSessionId) && !positionTicks.HasValue))
+        {
+            return;
+        }
+
+        try
+        {
+            await _activityManager.CreateAsync(new ActivityLog(
+                string.Format(CultureInfo.InvariantCulture, "{0} deleted {1}", user.Username, item.Name),
+                "PlaybackItemDeleted",
+                user.Id)
+            {
+                ItemId = item.Id.ToString("N", CultureInfo.InvariantCulture),
+                Overview = BuildPlaybackContextOverview(playSessionId, positionTicks),
+                ShortOverview = string.Format(CultureInfo.InvariantCulture, _localization.GetServerLocalizedString("AppDeviceValues"), User.GetClient(), User.GetDevice())
+            }).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Error logging playback delete for item {ItemId}", item.Id);
+        }
+    }
+
+    private static string BuildPlaybackContextOverview(string? playSessionId, long? positionTicks)
+    {
+        var sessionValue = string.IsNullOrWhiteSpace(playSessionId)
+            ? "n/a"
+            : playSessionId;
+        var positionValue = positionTicks.HasValue
+            ? positionTicks.Value.ToString(CultureInfo.InvariantCulture)
+            : "n/a";
+        return string.Format(
+            CultureInfo.InvariantCulture,
+            "playSessionId={0}; positionTicks={1}",
+            sessionValue,
+            positionValue);
     }
 
     private static string[] GetRepresentativeItemTypes(CollectionType? contentType)

@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.ComponentModel.DataAnnotations;
+using System.Globalization;
 using System.Linq;
 using System.Threading.Tasks;
 using Jellyfin.Api.Extensions;
@@ -8,6 +9,7 @@ using Jellyfin.Api.Helpers;
 using Jellyfin.Api.ModelBinders;
 using Jellyfin.Data;
 using Jellyfin.Data.Enums;
+using Jellyfin.Database.Implementations.Entities;
 using Jellyfin.Database.Implementations.Enums;
 using Jellyfin.Extensions;
 using MediaBrowser.Common.Extensions;
@@ -17,6 +19,7 @@ using MediaBrowser.Controller.Entities.Movies;
 using MediaBrowser.Controller.Library;
 using MediaBrowser.Controller.Playlists;
 using MediaBrowser.Controller.Session;
+using MediaBrowser.Model.Activity;
 using MediaBrowser.Model.Dto;
 using MediaBrowser.Model.Entities;
 using MediaBrowser.Model.Globalization;
@@ -44,6 +47,7 @@ public class ItemsController : BaseJellyfinApiController
     private readonly ISessionManager _sessionManager;
     private readonly IUserDataManager _userDataRepository;
     private readonly ISearchManager _searchManager;
+    private readonly IActivityManager _activityManager;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="ItemsController"/> class.
@@ -56,6 +60,7 @@ public class ItemsController : BaseJellyfinApiController
     /// <param name="sessionManager">Instance of the <see cref="ISessionManager"/> interface.</param>
     /// <param name="userDataRepository">Instance of the <see cref="IUserDataManager"/> interface.</param>
     /// <param name="searchManager">Instance of the <see cref="ISearchManager"/> interface.</param>
+    /// <param name="activityManager">Instance of the <see cref="IActivityManager"/> interface.</param>
     public ItemsController(
         IUserManager userManager,
         ILibraryManager libraryManager,
@@ -64,7 +69,8 @@ public class ItemsController : BaseJellyfinApiController
         ILogger<ItemsController> logger,
         ISessionManager sessionManager,
         IUserDataManager userDataRepository,
-        ISearchManager searchManager)
+        ISearchManager searchManager,
+        IActivityManager activityManager)
     {
         _userManager = userManager;
         _libraryManager = libraryManager;
@@ -74,6 +80,7 @@ public class ItemsController : BaseJellyfinApiController
         _sessionManager = sessionManager;
         _userDataRepository = userDataRepository;
         _searchManager = searchManager;
+        _activityManager = activityManager;
     }
 
     /// <summary>
@@ -1115,7 +1122,9 @@ public class ItemsController : BaseJellyfinApiController
     /// </summary>
     /// <param name="userId">The user id.</param>
     /// <param name="itemId">The item id.</param>
-    /// <param name="userDataDto">New user data object.</param>
+    /// <param name="playSessionId">The playback session identifier.</param>
+    /// <param name="positionTicks">The playback position in ticks.</param>
+    /// <param name="userDataDto">The new user data object.</param>
     /// <response code="200">return updated user item data.</response>
     /// <response code="404">Item is not found.</response>
     /// <returns>Return <see cref="UserItemDataDto"/>.</returns>
@@ -1123,9 +1132,11 @@ public class ItemsController : BaseJellyfinApiController
     [ProducesResponseType(StatusCodes.Status200OK)]
     [ProducesResponseType(StatusCodes.Status404NotFound)]
     [Tags("UserData")]
-    public ActionResult<UserItemDataDto?> UpdateItemUserData(
+    public async Task<ActionResult<UserItemDataDto?>> UpdateItemUserData(
         [FromQuery] Guid? userId,
         [FromRoute, Required] Guid itemId,
+        [FromQuery] string? playSessionId,
+        [FromQuery] long? positionTicks,
         [FromBody, Required] UpdateUserItemDataDto userDataDto)
     {
         var requestUserId = RequestHelpers.GetUserId(User, userId);
@@ -1146,9 +1157,12 @@ public class ItemsController : BaseJellyfinApiController
             return NotFound();
         }
 
+        var previousRating = _userDataRepository.GetUserDataDto(item, user)?.Rating;
         _userDataRepository.SaveUserData(user, item, userDataDto, UserDataSaveReason.UpdateUserData);
+        var updatedUserData = _userDataRepository.GetUserDataDto(item, user);
+        await TryLogPlaybackRatingUpdateAsync(user, item, previousRating, updatedUserData?.Rating, playSessionId, positionTicks).ConfigureAwait(false);
 
-        return _userDataRepository.GetUserDataDto(item, user);
+        return updatedUserData;
     }
 
     /// <summary>
@@ -1165,9 +1179,73 @@ public class ItemsController : BaseJellyfinApiController
     [ProducesResponseType(StatusCodes.Status404NotFound)]
     [Obsolete("Kept for backwards compatibility")]
     [ApiExplorerSettings(IgnoreApi = true)]
-    public ActionResult<UserItemDataDto?> UpdateItemUserDataLegacy(
+    public Task<ActionResult<UserItemDataDto?>> UpdateItemUserDataLegacy(
         [FromRoute, Required] Guid userId,
         [FromRoute, Required] Guid itemId,
         [FromBody, Required] UpdateUserItemDataDto userDataDto)
-        => UpdateItemUserData(userId, itemId, userDataDto);
+        => UpdateItemUserData(userId, itemId, null, null, userDataDto);
+
+    private async Task TryLogPlaybackRatingUpdateAsync(
+        User user,
+        BaseItem item,
+        double? previousRating,
+        double? updatedRating,
+        string? playSessionId,
+        long? positionTicks)
+    {
+        if (string.IsNullOrWhiteSpace(playSessionId) && !positionTicks.HasValue)
+        {
+            return;
+        }
+
+        if (previousRating == updatedRating)
+        {
+            return;
+        }
+
+        try
+        {
+            var ratingLabel = updatedRating.HasValue
+                ? updatedRating.Value.ToString("0.##", CultureInfo.InvariantCulture)
+                : "cleared";
+
+            await _activityManager.CreateAsync(new ActivityLog(
+                string.Format(
+                    CultureInfo.InvariantCulture,
+                    "{0} rated {1}: {2}",
+                    user.Username,
+                    item.Name,
+                    ratingLabel),
+                "PlaybackUserRatingUpdated",
+                user.Id)
+            {
+                ItemId = item.Id.ToString("N", CultureInfo.InvariantCulture),
+                Overview = BuildPlaybackContextOverview(playSessionId, positionTicks),
+                ShortOverview = string.Format(
+                    CultureInfo.InvariantCulture,
+                    _localization.GetServerLocalizedString("AppDeviceValues"),
+                    User.GetClient(),
+                    User.GetDevice())
+            }).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Error logging playback rating update for item {ItemId}", item.Id);
+        }
+    }
+
+    private static string BuildPlaybackContextOverview(string? playSessionId, long? positionTicks)
+    {
+        var sessionValue = string.IsNullOrWhiteSpace(playSessionId)
+            ? "n/a"
+            : playSessionId;
+        var positionValue = positionTicks.HasValue
+            ? positionTicks.Value.ToString(CultureInfo.InvariantCulture)
+            : "n/a";
+        return string.Format(
+            CultureInfo.InvariantCulture,
+            "playSessionId={0}; positionTicks={1}",
+            sessionValue,
+            positionValue);
+    }
 }
