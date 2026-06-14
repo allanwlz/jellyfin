@@ -244,6 +244,11 @@ namespace MediaBrowser.Controller.Entities
 
         public double? MinCommunityRating { get; set; }
 
+        /// <summary>
+        /// Gets or sets the minimum user rating in stars (1-5).
+        /// </summary>
+        public int? MinUserRatingStars { get; set; }
+
         public IReadOnlyList<Guid> ChannelIds { get; set; }
 
         public int? ParentIndexNumber { get; set; }

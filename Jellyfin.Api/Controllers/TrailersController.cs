@@ -233,6 +233,7 @@ public class TrailersController : BaseJellyfinApiController
                 isUnaired,
                 minCommunityRating,
                 minCriticRating,
+                null,
                 minPremiereDate,
                 minDateLastSaved,
                 minDateLastSavedForUser,

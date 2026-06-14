@@ -438,6 +438,17 @@ public sealed partial class BaseItemRepository
             baseQuery = baseQuery.Where(e => e.UserData!.Any(ud => ud.UserId == filter.User!.Id && ud.Rating >= UserItemData.MinLikeValue) == isLiked);
         }
 
+        if (filter.MinUserRatingStars is >= 1 and <= 5)
+        {
+            var threshold = UserItemData.GetMinUserRatingThreshold(filter.MinUserRatingStars.Value);
+            var userId = filter.User!.Id;
+            baseQuery = baseQuery.Where(e =>
+                e.UserData!.Any(ud =>
+                    ud.UserId == userId
+                    && ud.Rating != null
+                    && ud.Rating >= threshold));
+        }
+
         if (filter.IsFavoriteOrLiked.HasValue)
         {
             var isFavoriteOrLiked = filter.IsFavoriteOrLiked.Value;

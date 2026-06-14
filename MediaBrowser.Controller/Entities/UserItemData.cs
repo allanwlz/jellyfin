@@ -117,5 +117,17 @@ namespace MediaBrowser.Controller.Entities
                 }
             }
         }
+
+        /// <summary>
+        /// Gets the minimum stored rating for a user rating filter in stars (1-5).
+        /// </summary>
+        /// <param name="minStars">The minimum star count.</param>
+        /// <returns>The minimum stored rating threshold.</returns>
+        public static double GetMinUserRatingThreshold(int minStars)
+        {
+            var starsOffset = minStars - 1;
+            var doubled = starsOffset * 2;
+            return doubled + 1;
+        }
     }
 }
